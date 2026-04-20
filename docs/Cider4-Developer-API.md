@@ -21,6 +21,7 @@ The v2 API provides a modern, RESTful interface for controlling Cider 4.x — pl
    - [Queue](#queue)
    - [Audio](#audio)
    - [Library](#library)
+   - [Plugins](#plugins)
    - [Events catalog](#events-catalog)
 8. [WebSocket channel](#websocket-channel)
 9. [v1 to v2 migration guide](#v1-to-v2-migration-guide)
@@ -44,7 +45,7 @@ A token can be obtained three ways — see [Obtaining a token](#obtaining-a-toke
 
 Every v2 endpoint except [Scope-less endpoints](#scope-less-endpoints) and [`POST /api/v2/auth/request`](#post-apiv2authrequest) requires a valid `apptoken` header. Tokens carry a list of **scopes** that determine which endpoints the token can reach.
 
-### The 5 scopes
+### The 6 scopes
 
 | Scope | Covers |
 |---|---|
@@ -53,6 +54,7 @@ Every v2 endpoint except [Scope-less endpoints](#scope-less-endpoints) and [`POS
 | `library` | All `/api/v2/library/*` — playlists, albums, artists, songs; love/dislike; add/remove |
 | `audio` | All `/api/v2/audio/*` — volume, crossfade, automix, atmos |
 | `account` | `/api/v2/client/tokens` — reads your Apple Music developer + user tokens + storefront |
+| `plugins` | `/api/v2/plugins/install` — request a plugin install. **Each install still requires explicit per-plugin user consent via a dialog**, so the scope is necessary but not sufficient. |
 
 A token with only `playback` cannot read your library. A token with only `library` cannot set the volume. Users pick which scopes to grant at creation time.
 
@@ -162,6 +164,14 @@ See the full spec under [Auth → `POST /api/v2/auth/request`](#post-apiv2authre
 | `AUTH_REQUEST_COOLDOWN` | 429 | Same IP fired another request within 5 s |
 | `AUTH_REQUEST_BANNED` | 429 | Same IP hit 3 denials in 5 min → 15 min ban |
 | `AUTH_RESPONSE_MALFORMED` | 500 | Dialog returned unexpected shape (bug; file an issue) |
+| `PLUGIN_INSTALL_DENIED` | 403 | User denied the install dialog |
+| `PLUGIN_INSTALL_TIMEOUT` | 408 | User did not respond within 3 min |
+| `PLUGIN_INSTALL_BUSY` | 409 | Another install dialog is already pending |
+| `PLUGIN_INSTALL_COOLDOWN` | 429 | Same IP fired another install request within 2 s |
+| `PLUGIN_BAD_ZIP` | 422 | Downloaded file isn't a valid zip |
+| `PLUGIN_BAD_MANIFEST` | 422 | `plugin.yml` missing / malformed / missing `identifier` |
+| `PLUGIN_DOWNLOAD_FAILED` | 502 | URL unreachable or returned non-200 |
+| `PLUGIN_INSTALL_FAILED` | 500 | Extraction / filesystem error after consent |
 | `RPC_TIMEOUT` | 504 | Frontend did not respond within 30 s |
 
 `429` responses include a `Retry-After: <seconds>` header.
@@ -170,16 +180,26 @@ See the full spec under [Auth → `POST /api/v2/auth/request`](#post-apiv2authre
 
 ## Rate limiting
 
-Only `POST /api/v2/auth/request` is rate-limited today (because it's the one endpoint accessible without a token). All other endpoints rely on token-based access control.
+Two endpoints are rate-limited. All other endpoints rely on token-based access control alone.
 
-The auth-request limiter, per source IP:
+### `POST /api/v2/auth/request` (unauthenticated)
 
 | Guard | Default | Error |
 |---|---|---|
-| Cooldown between requests | 5 s | `AUTH_REQUEST_COOLDOWN` (429) |
-| Denials in rolling window | 3 in 5 min → 15 min ban | `AUTH_REQUEST_BANNED` (429) |
+| Cooldown between requests (per IP) | 5 s | `AUTH_REQUEST_COOLDOWN` (429) |
+| Denials in rolling window (per IP) | 3 in 5 min → 15 min ban | `AUTH_REQUEST_BANNED` (429) |
 | Concurrent pending dialogs (global) | 1 | `AUTH_REQUEST_BUSY` (409) |
 | User-response timeout | 2 min | `AUTH_REQUEST_TIMEOUT` (408) |
+
+### `POST /api/v2/plugins/install` (scoped)
+
+Lighter limits since callers already hold a token:
+
+| Guard | Default | Error |
+|---|---|---|
+| Cooldown between requests (per IP) | 2 s | `PLUGIN_INSTALL_COOLDOWN` (429) |
+| Concurrent pending dialogs (global) | 1 | `PLUGIN_INSTALL_BUSY` (409) |
+| User-response timeout | 3 min | `PLUGIN_INSTALL_TIMEOUT` (408) |
 
 State is in-memory and clears when Cider restarts.
 
@@ -593,6 +613,68 @@ All songs in the library (songs tab). Same shape as playlist songs.
 
 ---
 
+### Plugins
+
+All endpoints below require the `plugins` scope. **Each install also requires explicit per-plugin user consent via a dialog**, even with the scope — the scope is the gate for "this app can ask", the dialog is the gate for "this specific plugin gets installed".
+
+#### `POST /api/v2/plugins/install`
+
+**Scope:** `plugins`
+
+Request a plugin install from a .zip URL. The server downloads the zip, validates `plugin.yml`, then pushes a consent dialog to the Cider device showing the real (not caller-claimed) manifest. The HTTP request blocks until the user approves, denies, or the 3-minute timeout elapses.
+
+**Request body:**
+
+```json
+{ "url": "https://example.com/my-plugin.zip" }
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `url` | string | yes | http(s) URL to the .zip. ≤ 2048 chars. |
+
+**Responses:**
+
+| Status | Body | Meaning |
+|---|---|---|
+| 200 | `{ "data": { "identifier", "name", "version", "installPath" } }` | User approved; plugin installed. Cider usually needs a reload to activate new plugins. |
+| 400 | `{ "error": { "code": "INVALID_REQUEST", … } }` | Body shape / URL bad |
+| 403 | `{ "error": { "code": "PLUGIN_INSTALL_DENIED", … } }` | User clicked Cancel |
+| 403 | `{ "error": { "code": "INSUFFICIENT_SCOPE", … } }` | Token lacks `plugins` scope |
+| 408 | `{ "error": { "code": "PLUGIN_INSTALL_TIMEOUT", … } }` | 3 min elapsed without user action |
+| 409 | `{ "error": { "code": "PLUGIN_INSTALL_BUSY", … } }` | Another install dialog is already pending |
+| 422 | `{ "error": { "code": "PLUGIN_BAD_ZIP" \| "PLUGIN_BAD_MANIFEST", … } }` | Download succeeded but is not a valid plugin |
+| 429 | `{ "error": { "code": "PLUGIN_INSTALL_COOLDOWN", … } }` | 2 s per-IP cooldown |
+| 502 | `{ "error": { "code": "PLUGIN_DOWNLOAD_FAILED", … } }` | URL unreachable / 4xx / 5xx |
+
+**Example:**
+
+```bash
+curl -X POST http://127.0.0.1:10767/api/v2/plugins/install \
+  -H 'Content-Type: application/json' \
+  -H 'apptoken: YOUR_TOKEN' \
+  -d '{"url": "https://example.com/my-plugin.zip"}'
+```
+
+Dialog on the Cider device shows the plugin name, author, version, description, source host, and size. On approve:
+
+```json
+{
+  "data": {
+    "identifier": "com.example.my-plugin",
+    "name": "My Plugin",
+    "version": "1.2.3",
+    "installPath": "/.../plugins/com.example.my-plugin"
+  }
+}
+```
+
+If a plugin with the same `identifier` is already installed, the dialog displays an **Upgrade** chip and the install replaces the existing folder on approve.
+
+**Alternative: `cider://install-plugin?url=<zip-url>`** — on-device protocol URL that opens the same dialog with no scope / token required. See [Obtaining a token → Option B](#option-b--ciderrequest-auth-deep-link) for the launch pattern (same idea, different host).
+
+---
+
 ### Events catalog
 
 #### `GET /api/v2/events/catalog`
@@ -702,5 +784,7 @@ v1 endpoints are unscoped and remain fully functional. The v2 equivalents below 
 - `GET /api/v2/client/tokens`
 - `GET /api/v2/events/catalog`
 - `POST /api/v2/auth/request` — unauthenticated token bootstrap
-- `cider://request-auth?…` protocol URL — on-device consent
+- `POST /api/v2/plugins/install` — scoped, consent-gated plugin install
+- `cider://request-auth?…` protocol URL — on-device token consent
+- `cider://install-plugin?url=…` protocol URL — on-device plugin install consent
 - Scoped token model — see [Authentication & scopes](#authentication--scopes)
