@@ -1,6 +1,6 @@
 # Cider v2 API Reference
 
-The v2 API provides a modern, RESTful interface for controlling Cider 4.x — playback, queue, audio features, library, and scoped authorization. All endpoints are prefixed with `/api/v2/`.
+The v2 API provides a modern, RESTful interface for controlling Cider 4.x — playback, queue, audio features, library, settings, and scoped authorization. All endpoints are prefixed with `/api/v2/`.
 
 > **v1 Compatibility:** The original `/api/v1/playback/*` endpoints remain fully functional and are unscoped. v2 is a parallel API with better structure, scope-aware auth, and consistent response formatting. See the [migration guide](#v1-to-v2-migration-guide) at the end.
 
@@ -22,6 +22,7 @@ The v2 API provides a modern, RESTful interface for controlling Cider 4.x — pl
    - [Audio](#audio)
    - [Library](#library)
    - [Plugins](#plugins)
+   - [Config](#config)
    - [Events catalog](#events-catalog)
 8. [WebSocket channel](#websocket-channel)
 9. [v1 to v2 migration guide](#v1-to-v2-migration-guide)
@@ -45,7 +46,7 @@ A token can be obtained three ways — see [Obtaining a token](#obtaining-a-toke
 
 Every v2 endpoint except [Scope-less endpoints](#scope-less-endpoints) and [`POST /api/v2/auth/request`](#post-apiv2authrequest) requires a valid `apptoken` header. Tokens carry a list of **scopes** that determine which endpoints the token can reach.
 
-### The 6 scopes
+### The 7 scopes
 
 | Scope | Covers |
 |---|---|
@@ -55,6 +56,7 @@ Every v2 endpoint except [Scope-less endpoints](#scope-less-endpoints) and [`POS
 | `audio` | All `/api/v2/audio/*` — volume, crossfade, automix, atmos |
 | `account` | `/api/v2/client/tokens` — reads your Apple Music developer + user tokens + storefront |
 | `plugins` | `/api/v2/plugins/install` — request a plugin install. **Each install still requires explicit per-plugin user consent via a dialog**, so the scope is necessary but not sufficient. |
+| `config` | `GET /api/v2/config` — read-only snapshot of Cider's settings for syncing into external apps. Credentials are redacted and plugin settings are excluded — see [Config](#config). |
 
 A token with only `playback` cannot read your library. A token with only `library` cannot set the volume. Users pick which scopes to grant at creation time.
 
@@ -101,7 +103,7 @@ Query parameters:
 | Param | Required | Notes |
 |---|---|---|
 | `app-name` | Yes | Display name shown in the dialog (URL-encoded, 1–64 chars) |
-| `scopes` | Yes | Comma-separated subset of the 5 scopes |
+| `scopes` | Yes | Comma-separated subset of the 7 scopes |
 | `app-image` | No | Icon URL. Must be `https://` or `data:image/{png,jpeg,gif,webp,svg+xml}` ≤ 128 KB. A bad/unreachable URL falls back to a generic lock icon. |
 
 Opening the URL focuses Cider and shows the consent dialog. On Approve, the token is shown once on-screen for the user to copy into the requesting app. No programmatic return path — the user transfers the token manually.
@@ -172,6 +174,7 @@ See the full spec under [Auth → `POST /api/v2/auth/request`](#post-apiv2authre
 | `PLUGIN_BAD_MANIFEST` | 422 | `plugin.yml` missing / malformed / missing `identifier` |
 | `PLUGIN_DOWNLOAD_FAILED` | 502 | URL unreachable or returned non-200 |
 | `PLUGIN_INSTALL_FAILED` | 500 | Extraction / filesystem error after consent |
+| `CONFIG_PATH_NOT_FOUND` | 404 | `?path=` does not match any config key |
 | `RPC_TIMEOUT` | 504 | Frontend did not respond within 30 s |
 
 `429` responses include a `Retry-After: <seconds>` header.
@@ -229,7 +232,7 @@ State is in-memory and clears when Cider restarts.
 |---|---|---|---|
 | `app_name` | string | yes | 1–64 chars; shown in the consent dialog |
 | `app_image` | string | no | `https://` URL or `data:image/…` (≤ 128 KB); falls back to generic icon on error |
-| `scopes` | string[] | yes | Non-empty subset of the 5 known scopes |
+| `scopes` | string[] | yes | Non-empty subset of the 7 known scopes |
 
 **Responses:**
 
@@ -675,6 +678,56 @@ If a plugin with the same `identifier` is already installed, the dialog displays
 
 ---
 
+### Config
+
+#### `GET /api/v2/config`
+
+**Scope:** `config`
+
+Read-only snapshot of Cider's configuration (the same data persisted to `spa-config.yml`) — appearance, audio, lyrics, connectivity, behavior, and the rest. Built for external apps that want to mirror or sync Cider's settings; poll it (or re-fetch on demand) to pick up changes the user makes in Settings.
+
+**Redaction.** The snapshot is sanitized before it leaves Cider, even for legacy all-access tokens:
+
+- `connectivity.apiTokens[*].token` values are replaced with `"<redacted>"`. Token metadata (name, scopes, creation time) is kept; the secrets are not — a `config`-scoped token can never escalate by reading other tokens.
+- `remote.tunnelUUID` is replaced with `"<redacted>"` when set.
+- The `plugins` settings subtree is omitted entirely. Plugin settings are schema-less third-party data that may contain secrets Cider cannot identify.
+
+The config is **read-only** through this endpoint by design. Settings that are writable over the API have dedicated, validated endpoints (e.g. [`PATCH /api/v2/audio/crossfade`](#crossfade)) that also keep the running app in sync.
+
+**Query parameters:**
+
+| Param | Required | Notes |
+|---|---|---|
+| `path` | No | Dot-notation subtree selector, e.g. `audio.crossfade` or `visual.appearance`. Returns just that value instead of the full object. |
+
+**Responses:**
+
+| Status | Body | Meaning |
+|---|---|---|
+| 200 | `{ "data": { …full config… } }` (no `path`) or `{ "data": <value> }` (with `path`) | Snapshot or subtree value |
+| 400 | `{ "error": { "code": "INVALID_REQUEST", … } }` | `path` is empty or not valid dot-notation |
+| 403 | `{ "error": { "code": "INSUFFICIENT_SCOPE", … } }` | Token lacks the `config` scope |
+| 404 | `{ "error": { "code": "CONFIG_PATH_NOT_FOUND", … } }` | `path` does not match any config key |
+
+**Examples:**
+
+```bash
+# Full snapshot
+curl -H "apptoken: YOUR_TOKEN" http://127.0.0.1:10767/api/v2/config
+
+# Just the crossfade settings
+curl -H "apptoken: YOUR_TOKEN" "http://127.0.0.1:10767/api/v2/config?path=audio.crossfade"
+# → { "data": { "enabled": true, "durationSec": 5, … } }
+
+# A single scalar
+curl -H "apptoken: YOUR_TOKEN" "http://127.0.0.1:10767/api/v2/config?path=visual.appearance"
+# → { "data": "dark" }
+```
+
+> **Note:** the config shape follows Cider's internal settings model and may gain or move keys between releases as features evolve. Treat unknown keys as opaque and prefer `path` reads for the specific values you sync.
+
+---
+
 ### Events catalog
 
 #### `GET /api/v2/events/catalog`
@@ -782,6 +835,7 @@ v1 endpoints are unscoped and remain fully functional. The v2 equivalents below 
 - `GET /api/v2/library/songs`
 - `GET /api/v2/client/info`
 - `GET /api/v2/client/tokens`
+- `GET /api/v2/config` — scoped, redacted settings snapshot (full or `?path=` subtree)
 - `GET /api/v2/events/catalog`
 - `POST /api/v2/auth/request` — unauthenticated token bootstrap
 - `POST /api/v2/plugins/install` — scoped, consent-gated plugin install
