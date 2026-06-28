@@ -1,0 +1,38 @@
+name: 'Bug Report Status Callback'
+
+on:
+  issues:
+    types: [closed, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  notify-rise:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Notify Rise of issue status
+        env:
+          CALLBACK_SECRET: ${{ secrets.RISE_BUGREPORT_CALLBACK_SECRET }}
+          RISE_URL: ${{ vars.RISE_API_URL || 'https://exp-rise.cider.sh' }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_STATE: ${{ github.event.issue.state }}
+          LABELS: ${{ toJson(github.event.issue.labels.*.name) }}
+        run: |
+          if [ -z "$CALLBACK_SECRET" ]; then
+            echo "RISE_BUGREPORT_CALLBACK_SECRET not configured; skipping."
+            exit 0
+          fi
+          payload=$(jq -n \
+            --arg repo "$REPO" \
+            --argjson issueNumber "$ISSUE_NUMBER" \
+            --arg state "$ISSUE_STATE" \
+            --argjson labels "$LABELS" \
+            '{repo: $repo, issueNumber: $issueNumber, state: $state, labels: $labels}')
+          # Non-fatal: a status callback failure must never fail the workflow.
+          curl -fsS -X POST "$RISE_URL/api/v1/support/client-reports/status" \
+            -H "Content-Type: application/json" \
+            -H "X-Callback-Secret: $CALLBACK_SECRET" \
+            -d "$payload" || echo "Rise status callback failed (non-fatal)"
