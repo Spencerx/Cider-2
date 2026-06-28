@@ -23,7 +23,7 @@ body:
           required: true
         - label: I have searched the [issue tracker](https://github.com/ciderapp/Cider-2/issues) for a bug report that matches the one I want to file, without success.
           required: true
-        - label: I have confirmed that no [support FAQ](https://cider.sh/docs/client/faqs) resolves my issue.
+        - label: I have confirmed that no [support FAQ](https://github.com/ciderapp/Cider-2/tree/main?tab=readme-ov-file#faq) resolves my issue.
           required: true
         - label: I have checked that the correct behavior occurs on [Apple Music Web](https://music.apple.com) (if applicable).
           required: true
