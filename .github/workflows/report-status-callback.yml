@@ -32,7 +32,7 @@ jobs:
             --argjson labels "$LABELS" \
             '{repo: $repo, issueNumber: $issueNumber, state: $state, labels: $labels}')
           # Non-fatal: a status callback failure must never fail the workflow.
-          curl -fsS -X POST "$RISE_URL/api/v1/support/client-reports/status" \
+          curl -fsS -X POST "$RISE_URL/api/v1/client-reports/status" \
             -H "Content-Type: application/json" \
             -H "X-Callback-Secret: $CALLBACK_SECRET" \
             -d "$payload" || echo "Rise status callback failed (non-fatal)"

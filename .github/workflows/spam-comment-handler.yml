@@ -1,0 +1,82 @@
+name: 'Handle Malware Spam Comments'
+
+on:
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+concurrency:
+  group: spam-comment-${{ github.event.comment.id }}
+  cancel-in-progress: false
+
+jobs:
+  triage:
+    name: Detect and remove zip malware spam
+    runs-on: ubuntu-latest
+    if: contains(github.event.comment.body, '.zip')
+    steps:
+      - uses: jamestrousdale/github-app-jwt-token@0.1.4
+        id: gen
+        with:
+          app-id: '363587'
+          private-key: ${{ secrets.APP_KEY }}
+
+      - name: Evaluate comment and remove if spam
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.gen.outputs.access-token }}
+          script: |
+            const comment = context.payload.comment;
+            const author = comment.user?.login || 'unknown';
+            const association = comment.author_association || 'NONE';
+
+            if (comment.user?.type === 'Bot') {
+              core.info(`Skipping bot comment from ${author}.`);
+              return;
+            }
+
+            const TRUSTED = new Set(['OWNER', 'MEMBER', 'COLLABORATOR', 'CONTRIBUTOR']);
+            if (TRUSTED.has(association)) {
+              core.info(`Skipping trusted author ${author} (${association}).`);
+              return;
+            }
+
+            const body = comment.body || '';
+            const ZIP_URL = /https?:\/\/[^\s)\]"'<>]+\.zip\b/i;          // bare or linked URL ending in .zip
+            const ZIP_LINK_TEXT = /\[[^\]]*\.zip\b[^\]]*\]\([^)]+\)/i;   // [something.zip](url)
+            if (!ZIP_URL.test(body) && !ZIP_LINK_TEXT.test(body)) {
+              core.info('No .zip link found in comment body; nothing to do.');
+              return;
+            }
+
+            core.warning(
+              `Zip attachment from untrusted author ${author} (${association}) ` +
+              `on ${comment.html_url} — treating as malware spam.`
+            );
+
+            const { owner, repo } = context.repo;
+
+            try {
+              await github.graphql(
+                `mutation($id: ID!) {
+                   minimizeComment(input: { classifier: SPAM, subjectId: $id }) {
+                     minimizedComment { isMinimized }
+                   }
+                 }`,
+                { id: comment.node_id }
+              );
+              core.info('Comment minimized as SPAM.');
+            } catch (e) {
+              core.warning(`Could not minimize comment: ${e.message}`);
+            }
+
+            try {
+              await github.rest.issues.deleteComment({ owner, repo, comment_id: comment.id });
+              core.info(`Deleted comment ${comment.id} from ${author}.`);
+            } catch (e) {
+              core.setFailed(`Failed to delete comment ${comment.id}: ${e.message}`);
+            }
