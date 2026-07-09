@@ -1,3 +1,5 @@
+> [!IMPORTANT]  
+> THIS API IS DEPRECATED, PLEASE USE https://taproom.cider.sh/docs/api
 
 Base URL: `http://localhost:10767/`
 
